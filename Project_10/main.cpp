@@ -1,0 +1,1619 @@
+//========================================================================
+// OpenGL - Motor 3D Base: Primitivas Geométricas para Scene Graph
+// + Cámara + Órbitas + Espirales (objeto / cámara / ambos)
+//========================================================================
+
+#define GLAD_GL_IMPLEMENTATION
+#include <glad/gl.h>
+#define GLFW_INCLUDE_NONE
+#include <GLFW/glfw3.h>
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <map>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>   // [NUEVO] para std::max (antes entraba por include transitivo)
+
+using namespace std;
+
+const float PI = 3.14159265359f;
+
+void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+void processInput(GLFWwindow *window);
+
+const unsigned int SCR_WIDTH = 1000;
+const unsigned int SCR_HEIGHT = 800;
+
+// [NUEVO] Proporción actual de la ventana (ancho/alto). La usa la cámara
+// para la proyección y se actualiza sola al redimensionar la ventana.
+float g_aspecto = (float)SCR_WIDTH / (float)SCR_HEIGHT;
+
+// =========================================================================
+// SHADERS
+// [MODIFICADO] el vertex shader ahora multiplica por vista y proyeccion.
+// Ambas valen identidad por defecto, así que si no usas cámara todo se
+// comporta igual que antes.
+// =========================================================================
+const char *vertexShaderSource = "#version 330 core\n"
+    "layout (location = 0) in vec3 aPos;\n"
+    "uniform mat4 transform = mat4(1.0);\n"
+    "uniform mat4 vista = mat4(1.0);\n"
+    "uniform mat4 proyeccion = mat4(1.0);\n"
+    "void main()\n"
+    "{\n"
+    "   gl_Position = proyeccion * vista * transform * vec4(aPos, 1.0);\n"
+    "}\0";
+
+const char *fragmentShaderSource = "#version 330 core\n"
+    "out vec4 FragColor;\n"
+    "uniform vec4 ourColor = vec4(1.0, 1.0, 1.0, 1.0);\n"
+    "void main()\n"
+    "{\n"
+    "   FragColor = ourColor;\n"
+    "}\n\0";
+
+// =========================================================================
+// 1. GESTOR DE COLORES
+// =========================================================================
+enum class NombreColor {
+    Rojo, Verde, Azul, Amarillo, Celeste, Marron, Morado, Cyan,
+    Naranja, Rosa, Blanco, Negro, Gris, Beige, Fucsia, VerdeFluorescente, Violeta
+};
+
+class GestorColor {
+private:
+    unsigned int shaderID;
+    int colorLoc;
+public:
+    GestorColor(unsigned int shaderProgram) {
+        shaderID = shaderProgram;
+        colorLoc = glGetUniformLocation(shaderID, "ourColor");
+    }
+    void establecer(NombreColor color, float alpha = 1.0f) {
+        glUseProgram(shaderID);
+        switch (color) {
+            case NombreColor::Rojo:               glUniform4f(colorLoc, 1.0f, 0.0f, 0.0f, alpha); break;
+            case NombreColor::Verde:              glUniform4f(colorLoc, 0.0f, 1.0f, 0.0f, alpha); break;
+            case NombreColor::Azul:               glUniform4f(colorLoc, 0.0f, 0.0f, 1.0f, alpha); break;
+            case NombreColor::Amarillo:           glUniform4f(colorLoc, 1.0f, 1.0f, 0.0f, alpha); break;
+            case NombreColor::Celeste:            glUniform4f(colorLoc, 0.53f, 0.81f, 0.98f, alpha); break;
+            case NombreColor::Marron:             glUniform4f(colorLoc, 0.55f, 0.27f, 0.07f, alpha); break;
+            case NombreColor::Morado:             glUniform4f(colorLoc, 0.5f, 0.0f, 0.5f, alpha); break;
+            case NombreColor::Cyan:               glUniform4f(colorLoc, 0.0f, 1.0f, 1.0f, alpha); break;
+            case NombreColor::Naranja:            glUniform4f(colorLoc, 1.0f, 0.5f, 0.0f, alpha); break;
+            case NombreColor::Rosa:               glUniform4f(colorLoc, 1.0f, 0.75f, 0.8f, alpha); break;
+            case NombreColor::Blanco:             glUniform4f(colorLoc, 1.0f, 1.0f, 1.0f, alpha); break;
+            case NombreColor::Negro:              glUniform4f(colorLoc, 0.0f, 0.0f, 0.0f, alpha); break;
+            case NombreColor::Gris:               glUniform4f(colorLoc, 0.5f, 0.5f, 0.5f, alpha); break;
+            case NombreColor::Beige:              glUniform4f(colorLoc, 0.96f, 0.96f, 0.86f, alpha); break;
+            case NombreColor::Fucsia:             glUniform4f(colorLoc, 1.0f, 0.0f, 1.0f, alpha); break;
+            case NombreColor::VerdeFluorescente:  glUniform4f(colorLoc, 0.2f, 1.0f, 0.2f, alpha); break;
+            case NombreColor::Violeta:            glUniform4f(colorLoc, 0.54f, 0.17f, 0.89f, alpha); break;
+        }
+    }
+};
+
+// =========================================================================
+// 2. TRANSFORMADOR 3D (ACUMULATIVO)
+// =========================================================================
+class Transformador3D {
+private:
+    unsigned int shaderID;
+    int transformLoc;
+    float matrizActual[16];
+
+    void acumular(const float* nuevaMatriz) {
+        float temp[16];
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                temp[i * 4 + j] = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    temp[i * 4 + j] += matrizActual[i * 4 + k] * nuevaMatriz[k * 4 + j];
+                }
+            }
+        }
+        for (int i = 0; i < 16; i++) matrizActual[i] = temp[i];
+    }
+
+public:
+    Transformador3D(unsigned int shaderProgram) {
+        shaderID = shaderProgram;
+        transformLoc = glGetUniformLocation(shaderID, "transform");
+        reiniciar();
+    }
+
+    void reiniciar() {
+        float identidad[16] = {
+            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f
+        };
+        for (int i = 0; i < 16; i++) matrizActual[i] = identidad[i];
+    }
+
+    void trasladar(float tx, float ty, float tz) {
+        float mat[16] = { 1.f,0.f,0.f,tx,  0.f,1.f,0.f,ty,  0.f,0.f,1.f,tz,  0.f,0.f,0.f,1.f };
+        acumular(mat);
+    }
+    void escalar(float sx, float sy, float sz) {
+        float mat[16] = { sx,0.f,0.f,0.f,  0.f,sy,0.f,0.f,  0.f,0.f,sz,0.f,  0.f,0.f,0.f,1.f };
+        acumular(mat);
+    }
+    void rotarX(float g) {
+        float r = g * PI / 180.0f, c = cosf(r), s = sinf(r);
+        float mat[16] = { 1.f,0.f,0.f,0.f, 0.f,c,-s,0.f, 0.f,s,c,0.f, 0.f,0.f,0.f,1.f };
+        acumular(mat);
+    }
+    void rotarY(float g) {
+        float r = g * PI / 180.0f, c = cosf(r), s = sinf(r);
+        float mat[16] = { c,0.f,s,0.f, 0.f,1.f,0.f,0.f, -s,0.f,c,0.f, 0.f,0.f,0.f,1.f };
+        acumular(mat);
+    }
+    void rotarZ(float g) {
+        float r = g * PI / 180.0f, c = cosf(r), s = sinf(r);
+        float mat[16] = { c,-s,0.f,0.f, s,c,0.f,0.f, 0.f,0.f,1.f,0.f, 0.f,0.f,0.f,1.f };
+        acumular(mat);
+    }
+
+    // ---------------------------------------------------------------
+    // ORBITAR: hace que una figura gire alrededor de un punto (cx,cy,cz)
+    // a una distancia "radio", como un planeta alrededor del sol.
+    //   cx,cy,cz -> punto/centro de la órbita
+    //   radio    -> distancia de la figura al centro de la órbita
+    //   angulo   -> ángulo actual de la órbita en grados (usar tiempo*velocidad)
+    //   eje      -> 'X', 'Y' o 'Z' -> eje sobre el que gira la órbita
+    //
+    // TRUCO PARA ÓRBITAS ANIDADAS (tipo sistema solar con lunas):
+    // Si llamas a orbitar() dos veces seguidas SIN llamar reiniciar() en
+    // medio, la segunda órbita queda anidada dentro de la primera
+    // (la luna orbita al planeta, y el planeta orbita al sol).
+    // ---------------------------------------------------------------
+    void orbitar(float cx, float cy, float cz, float radio, float angulo, char eje = 'Y') {
+        trasladar(cx, cy, cz);
+        switch (eje) {
+            case 'X': case 'x': rotarX(angulo); break;
+            case 'Y': case 'y': rotarY(angulo); break;
+            case 'Z': case 'z': rotarZ(angulo); break;
+            default:            rotarY(angulo); break;
+        }
+        trasladar(radio, 0.0f, 0.0f);
+    }
+
+    void aplicar() {
+        glUseProgram(shaderID);
+        glUniformMatrix4fv(transformLoc, 1, GL_TRUE, matrizActual);
+    }
+};
+
+// =========================================================================
+// 3. ANIMADOR DE RUTAS (LERP)
+// =========================================================================
+struct Punto3D { float x, y, z; };
+class AnimadorRuta {
+private:
+    std::vector<Punto3D> puntos;
+public:
+    void agregarPunto(float x, float y, float z) { puntos.push_back({x, y, z}); }
+    void hacerIdaYVuelta() {
+        int n = puntos.size();
+        for (int i = n - 2; i >= 0; i--) puntos.push_back(puntos[i]);
+    }
+    Punto3D obtenerPosicionActual(float tiempoBase, float velocidad) {
+        if (puntos.empty()) return {0.0f, 0.0f, 0.0f};
+        if (puntos.size() == 1) return puntos[0];
+
+        float tiempoMod = tiempoBase * velocidad;
+        int tramo = (int)tiempoMod % (puntos.size() - 1);
+        float pct = tiempoMod - (int)tiempoMod;
+
+        Punto3D A = puntos[tramo];
+        Punto3D B = puntos[tramo + 1];
+        return { A.x + (B.x - A.x)*pct, A.y + (B.y - A.y)*pct, A.z + (B.z - A.z)*pct };
+    }
+};
+
+// =========================================================================
+// 4. ESTRUCTURA DEL GRAFO DE ESCENA (CLASE BASE FIGURA Y PRIMITIVAS)
+// =========================================================================
+
+// CLASE BASE ABSTRACTA
+class Figura {
+protected:
+    // Malla de relleno (triángulos)
+    unsigned int VAO, VBO;
+    int cantidadVertices;
+
+    // Malla de líneas (ARISTAS REALES, sin diagonales de triangulación)
+    unsigned int VAO_lineas = 0, VBO_lineas = 0;
+    int cantidadVerticesLineas = 0;
+    bool tieneLineas = false;
+
+    // Borde de la figura en 2D, en orden (para la función "pizza" más abajo).
+    // Solo lo usan las figuras 2D; las 3D simplemente no lo configuran.
+    std::vector<Punto3D> bordePoligono;
+
+    // Rango de vértices [inicio, inicio+cantidad) dentro del buffer de
+    // RELLENO que le corresponde a cada "cara" de una figura 3D. Con esto
+    // se puede dibujar/pintar cada cara por separado.
+    std::vector<int> caraInicio;
+    std::vector<int> caraCantidadVertices;
+
+    // Color "base" o "de fábrica" de la figura: el que se supone que debe
+    // tener el relleno cuando no se le hace ninguna personalización de
+    // caras. Se actualiza solo cada vez que se llama a
+    // dibujarRellenoYLineas(...) con un color de relleno, así que
+    // cambiarColorCaras() siempre sabe qué color usar para las caras que
+    // tú NO le indiques explícitamente, sin que tengas que repetirlo.
+    NombreColor colorBase = NombreColor::Blanco;
+
+    // [NUEVO] Posición de la figura en el mundo. El motor no la calcula
+    // solo: la actualizan las funciones orbitar*/espiral* (si les pasas la
+    // figura) o tú con establecerPosicion(). Sirve para que otra figura o
+    // la cámara puedan usar ESTA figura como centro de su órbita
+    // (Objetivo), aunque se esté moviendo.
+    Punto3D posicion = {0.0f, 0.0f, 0.0f};
+
+    // Sube la geometría de RELLENO (para dibujar con GL_TRIANGLES)
+    void configurarMalla(const std::vector<float>& vertices) {
+        cantidadVertices = vertices.size() / 3;
+        glGenVertexArrays(1, &VAO);
+        glGenBuffers(1, &VBO);
+
+        glBindVertexArray(VAO);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO);
+        glBufferData(GL_ARRAY_BUFFER, vertices.size() * sizeof(float), vertices.data(), GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+    }
+
+    // Sube la geometría de LÍNEAS: son las aristas reales de la figura,
+    // en pares consecutivos (inicio,fin, inicio,fin, ...) para dibujarse
+    // con GL_LINES. Como aquí NO se pasa por la triangulación de relleno,
+    // no aparece la diagonal que se ve al poner un cuadrado/cubo/rombo/
+    // trapecio en modo alambre con GL_TRIANGLES.
+    void configurarLineas(const std::vector<float>& verticesLineas) {
+        cantidadVerticesLineas = verticesLineas.size() / 3;
+        glGenVertexArrays(1, &VAO_lineas);
+        glGenBuffers(1, &VBO_lineas);
+
+        glBindVertexArray(VAO_lineas);
+        glBindBuffer(GL_ARRAY_BUFFER, VBO_lineas);
+        glBufferData(GL_ARRAY_BUFFER, verticesLineas.size() * sizeof(float), verticesLineas.data(), GL_STATIC_DRAW);
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+        tieneLineas = true;
+    }
+
+    // Guarda el contorno (en orden) de una figura 2D, usado por
+    // convertirPizza() para saber hasta dónde llega cada "rebanada".
+    void configurarBordePizza(const std::vector<Punto3D>& borde) {
+        bordePoligono = borde;
+    }
+
+    // Guarda, para una figura 3D, cuántos vértices ocupa cada cara dentro
+    // del buffer de relleno, en el mismo orden en que se subieron en el
+    // constructor. Ej: un cubo son 6 caras de 6 vértices cada una. TODAS
+    // las figuras 3D (Piramide, Cubo, Esfera, Cilindro, Cono) llaman a
+    // esto en su constructor, así que TODAS pueden usar
+    // cambiarColorCaras() más abajo.
+    void configurarCaras(const std::vector<int>& verticesPorCara) {
+        int acumulado = 0;
+        caraInicio.clear();
+        caraCantidadVertices.clear();
+        for (int cantidad : verticesPorCara) {
+            caraInicio.push_back(acumulado);
+            caraCantidadVertices.push_back(cantidad);
+            acumulado += cantidad;
+        }
+    }
+
+    // Busca dónde el rayo que sale de "centro" en dirección "angulo" choca
+    // contra el borde de la figura (bordePoligono), probando cada arista
+    // del polígono. Es lo que le da a convertirPizza() el punto exacto
+    // hasta donde debe llegar cada rebanada.
+    Punto3D interseccionConBorde(Punto3D centro, float angulo) const {
+        float dx = cosf(angulo), dy = sinf(angulo);
+        float mejorU = -1.0f;
+        Punto3D resultado = centro;
+        for (size_t i = 0; i < bordePoligono.size(); i++) {
+            Punto3D p1 = bordePoligono[i];
+            Punto3D p2 = bordePoligono[(i + 1) % bordePoligono.size()];
+            float x1 = p1.x, y1 = p1.y, x2 = p2.x, y2 = p2.y;
+            float x3 = centro.x, y3 = centro.y, x4 = centro.x + dx, y4 = centro.y + dy;
+            float denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+            if (fabs(denom) < 1e-6f) continue; // segmento paralelo al rayo
+            float t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+            float u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+            if (t >= 0.0f && t <= 1.0f && u > mejorU) {
+                mejorU = u;
+                resultado = { x3 + u * dx, y3 + u * dy, 0.0f };
+            }
+        }
+        return resultado;
+    }
+
+public:
+    virtual ~Figura() {
+        glDeleteVertexArrays(1, &VAO);
+        glDeleteBuffers(1, &VBO);
+        if (tieneLineas) {
+            glDeleteVertexArrays(1, &VAO_lineas);
+            glDeleteBuffers(1, &VBO_lineas);
+        }
+    }
+
+    // [NUEVO] Posición en el mundo (ver comentario del campo "posicion").
+    void establecerPosicion(float x, float y, float z) { posicion = {x, y, z}; }
+    void establecerPosicion(Punto3D p) { posicion = p; }
+    Punto3D obtenerPosicion() const { return posicion; }
+
+    // Dibuja la figura RELLENA (como antes)
+    virtual void dibujar() {
+        glBindVertexArray(VAO);
+        glDrawArrays(GL_TRIANGLES, 0, cantidadVertices);
+        glBindVertexArray(0);
+    }
+
+    // Dibuja SOLO el contorno/aristas reales de la figura (GL_LINES).
+    // Esta función se debe llamar explícitamente donde se quiera ver la
+    // figura en modo líneas; si nunca la llamas para una figura, esa
+    // figura jamás se ve en líneas (no depende de un estado global que
+    // afecte a todo el programa).
+    virtual void dibujarLineas() {
+        if (!tieneLineas) return; // esta figura no definió aristas propias
+        glBindVertexArray(VAO_lineas);
+        glDrawArrays(GL_LINES, 0, cantidadVerticesLineas);
+        glBindVertexArray(0);
+    }
+
+    // Dibuja el RELLENO y las LÍNEAS juntos, con el mismo color: primero
+    // el relleno, empujado levemente "hacia atrás" con glPolygonOffset
+    // para que no compita en profundidad con las líneas (si no se hace
+    // esto, las aristas parpadean/se pierden por estar exactamente a la
+    // misma distancia de la cámara que la malla rellena), y luego las
+    // aristas reales encima. Así se ve el color de adentro Y el contorno
+    // al mismo tiempo.
+    virtual void dibujarRellenoYLineas() {
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0f, 1.0f);
+        dibujar();
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        dibujarLineas();
+    }
+
+    // Misma idea, pero permite usar un color distinto para el relleno y
+    // para las líneas del contorno (por ejemplo: figura celeste con
+    // bordes negros), usando el mismo GestorColor del programa.
+    // De paso, recuerda "colorRelleno" como el colorBase de la figura,
+    // que es justo lo que después usa cambiarColorCaras() para las caras
+    // que no le indiques explícitamente.
+    virtual void dibujarRellenoYLineas(GestorColor& gestor, NombreColor colorRelleno, NombreColor colorLineas) {
+        colorBase = colorRelleno;
+        gestor.establecer(colorRelleno);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0f, 1.0f);
+        dibujar();
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        gestor.establecer(colorLineas);
+        dibujarLineas();
+    }
+
+    // ---------------------------------------------------------------
+    // SOBRECARGA "TODO EN UNO": RELLENO CON CARAS PERSONALIZADAS + LÍNEAS.
+    // Es la forma más cómoda de usar la función que pediste: en una sola
+    // llamada dibuja la figura completa (relleno + contorno), pero
+    // dejándote elegir el color de las caras que quieras.
+    //   colorBaseFigura -> el color "de fábrica" de la figura (el que
+    //                      tendrían TODAS sus caras si no tocaras nada)
+    //   coloresPorCara  -> mapa {índice de cara -> color que tú elijas}.
+    //                      Las caras que NO pongas aquí se quedan con
+    //                      colorBaseFigura automáticamente.
+    //   colorLineas     -> color del contorno/aristas
+    // ---------------------------------------------------------------
+    virtual void dibujarRellenoYLineas(GestorColor& gestor, NombreColor colorBaseFigura,
+                                        const std::map<int, NombreColor>& coloresPorCara,
+                                        NombreColor colorLineas) {
+        colorBase = colorBaseFigura;
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(1.0f, 1.0f);
+        cambiarColorCaras(gestor, coloresPorCara);
+        glDisable(GL_POLYGON_OFFSET_FILL);
+        gestor.establecer(colorLineas);
+        dibujarLineas();
+    }
+
+    // ---------------------------------------------------------------
+    // CONVERTIR PIZZA (solo figuras 2D): parte la figura como una pizza,
+    // dibujando "divisiones" líneas repartidas uniformemente en ángulo,
+    // desde un centro hasta el borde REAL de la figura (usando
+    // interseccionConBorde). No modifica la figura, solo dibuja encima
+    // las líneas de corte con el color que esté activo en ese momento
+    // (llama a gestorColor.establecer(...) antes de usarla).
+    //   divisiones -> en cuántas "porciones" se corta (cuántas líneas)
+    //   centro     -> desde dónde salen los cortes (por defecto el origen,
+    //                 que es el centro de todas las figuras 2D de este motor)
+    // ---------------------------------------------------------------
+    void convertirPizza(int divisiones, Punto3D centro = {0.0f, 0.0f, 0.0f}) {
+        if (bordePoligono.empty() || divisiones < 2) return; // esta figura no tiene borde 2D configurado
+
+        std::vector<float> lineas;
+        for (int i = 0; i < divisiones; i++) {
+            float angulo = 2.0f * PI * i / divisiones;
+            Punto3D borde = interseccionConBorde(centro, angulo);
+            lineas.push_back(centro.x); lineas.push_back(centro.y); lineas.push_back(centro.z);
+            lineas.push_back(borde.x);  lineas.push_back(borde.y);  lineas.push_back(borde.z);
+        }
+
+        // Se sube a un buffer temporal (GL_DYNAMIC_DRAW) porque "divisiones"
+        // lo elige quien llama a la función, puede cambiar en cualquier
+        // momento, y no vale la pena guardarlo de forma permanente.
+        unsigned int vaoTmp, vboTmp;
+        glGenVertexArrays(1, &vaoTmp);
+        glGenBuffers(1, &vboTmp);
+        glBindVertexArray(vaoTmp);
+        glBindBuffer(GL_ARRAY_BUFFER, vboTmp);
+        glBufferData(GL_ARRAY_BUFFER, lineas.size() * sizeof(float), lineas.data(), GL_DYNAMIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glDrawArrays(GL_LINES, 0, (int)(lineas.size() / 3));
+
+        glBindVertexArray(0);
+        glDeleteBuffers(1, &vboTmp);
+        glDeleteVertexArrays(1, &vaoTmp);
+    }
+
+    // ---------------------------------------------------------------
+    // PINTAR CARAS (solo figuras 3D con configurarCaras ya llamado en su
+    // constructor: Piramide, Cubo, Esfera, Cilindro y Cono): en vez de un
+    // solo color para toda la figura, dibuja cada cara por separado con
+    // su propio color.
+    // ---------------------------------------------------------------
+    int cantidadCaras() const { return (int)caraInicio.size(); }
+
+    // Establece manualmente el color base de la figura, por si quieres
+    // fijarlo sin pasar por dibujarRellenoYLineas(...) primero.
+    void establecerColorBase(NombreColor color) { colorBase = color; }
+    NombreColor obtenerColorBase() const { return colorBase; }
+
+    // Multicolor ALEATORIO: cada cara se pinta con un color al azar de la
+    // paleta dada (por defecto usa una paleta variada). Cada vez que se
+    // llama, se vuelve a sortear el color de cada cara.
+    void pintarCarasAleatorio(GestorColor& gestor,
+                               const std::vector<NombreColor>& paleta = {
+                                   NombreColor::Rojo, NombreColor::Verde, NombreColor::Azul,
+                                   NombreColor::Amarillo, NombreColor::Naranja, NombreColor::Morado,
+                                   NombreColor::Cyan, NombreColor::Rosa, NombreColor::Fucsia,
+                                   NombreColor::Celeste, NombreColor::VerdeFluorescente, NombreColor::Violeta }) {
+        if (caraInicio.empty() || paleta.empty()) { dibujar(); return; } // sin caras configuradas: relleno normal
+        glBindVertexArray(VAO);
+        for (size_t i = 0; i < caraInicio.size(); i++) {
+            gestor.establecer(paleta[rand() % paleta.size()]);
+            glDrawArrays(GL_TRIANGLES, caraInicio[i], caraCantidadVertices[i]);
+        }
+        glBindVertexArray(0);
+    }
+
+    // Colores ESPECÍFICOS (versión "clásica"): tú eliges el color de las
+    // caras que te interesen, y todas las que NO menciones se pintan con
+    // "colorBase" que TÚ pasas explícitamente en cada llamada.
+    // Se mantiene por compatibilidad; para el caso normal (que las caras
+    // no elegidas usen el color de fábrica de la figura sin tener que
+    // repetirlo) usa mejor cambiarColorCaras() de aquí abajo.
+    void pintarCarasEspecificas(GestorColor& gestor,
+                                 const std::map<int, NombreColor>& coloresPorCara,
+                                 NombreColor colorBaseParametro) {
+        colorBase = colorBaseParametro;
+        cambiarColorCaras(gestor, coloresPorCara);
+    }
+
+    // =================================================================
+    // *** CAMBIAR COLOR DE CARAS ***
+    // ---------------------------------------------------------------
+    // Esta es la función pedida: te deja elegir el color de las caras
+    // que quieras, UNA POR UNA, para CUALQUIER figura 3D del motor
+    // (Piramide, Cubo, Esfera, Cilindro, Cono... todas las que llamen a
+    // configurarCaras() en su constructor).
+    //
+    // A las caras que NO menciones en "coloresPorCara" se les asigna
+    // automáticamente "colorBase": el color de relleno que se supone que
+    // debería tener la figura sin ninguna modificación (el mismo que le
+    // diste la última vez que llamaste a dibujarRellenoYLineas(...), o el
+    // que hayas fijado a mano con establecerColorBase(...)). Así NUNCA
+    // tienes que repetir el color base cada vez que solo quieres tocar
+    // un par de caras.
+    //
+    // Cómo usarla:
+    //   figura.cambiarColorCaras(gestorColor, {
+    //       {0, NombreColor::Rojo},      // cara número 0 -> roja
+    //       {3, NombreColor::Violeta}    // cara número 3 -> violeta
+    //   });                              // el resto de caras -> colorBase
+    //
+    // El índice de cada cara depende del orden en que la figura las armó
+    // en su constructor (revisa el comentario de cada clase más abajo
+    // para saber qué índice corresponde a qué cara concreta).
+    //
+    // Nota: esta función solo pinta el RELLENO. Si además quieres ver el
+    // contorno en líneas, dibuja tú mismo dibujarLineas() después (o usa
+    // directamente la sobrecarga de 4 argumentos de
+    // dibujarRellenoYLineas(...) de más arriba, que ya hace las dos cosas
+    // en un solo llamado).
+    // =================================================================
+    void cambiarColorCaras(GestorColor& gestor, const std::map<int, NombreColor>& coloresPorCara) {
+        if (caraInicio.empty()) {
+            // Esta figura no tiene caras configuradas (p.ej. es 2D):
+            // simplemente se dibuja entera con el color base.
+            gestor.establecer(colorBase);
+            dibujar();
+            return;
+        }
+        glBindVertexArray(VAO);
+        for (size_t i = 0; i < caraInicio.size(); i++) {
+            auto it = coloresPorCara.find((int)i);
+            NombreColor color = (it != coloresPorCara.end()) ? it->second : colorBase;
+            gestor.establecer(color);
+            glDrawArrays(GL_TRIANGLES, caraInicio[i], caraCantidadVertices[i]);
+        }
+        glBindVertexArray(0);
+    }
+};
+
+// --- PRIMITIVAS 2D ---
+class Triangulo : public Figura {
+public:
+    Triangulo() {
+        float A[3] = {-0.5f, -0.5f, 0.0f};
+        float B[3] = { 0.5f, -0.5f, 0.0f};
+        float C[3] = { 0.0f,  0.5f, 0.0f};
+
+        std::vector<float> relleno = {
+            A[0],A[1],A[2],  B[0],B[1],B[2],  C[0],C[1],C[2]
+        };
+        configurarMalla(relleno);
+
+        std::vector<float> lineas = {
+            A[0],A[1],A[2],  B[0],B[1],B[2],
+            B[0],B[1],B[2],  C[0],C[1],C[2],
+            C[0],C[1],C[2],  A[0],A[1],A[2]
+        };
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza()
+        configurarBordePizza({
+            {A[0],A[1],A[2]}, {B[0],B[1],B[2]}, {C[0],C[1],C[2]}
+        });
+    }
+};
+
+class Cuadrado : public Figura {
+public:
+    Cuadrado() {
+        float TL[3] = {-0.5f,  0.5f, 0.0f};
+        float BL[3] = {-0.5f, -0.5f, 0.0f};
+        float BR[3] = { 0.5f, -0.5f, 0.0f};
+        float TR[3] = { 0.5f,  0.5f, 0.0f};
+
+        std::vector<float> relleno = {
+            TL[0],TL[1],TL[2],  BL[0],BL[1],BL[2],  BR[0],BR[1],BR[2], // Triángulo 1
+            TL[0],TL[1],TL[2],  BR[0],BR[1],BR[2],  TR[0],TR[1],TR[2]  // Triángulo 2
+        };
+        configurarMalla(relleno);
+
+        // Solo el contorno real (4 aristas), SIN la diagonal TL-BR que
+        // usa el relleno para formar los 2 triángulos.
+        std::vector<float> lineas = {
+            TL[0],TL[1],TL[2],  BL[0],BL[1],BL[2],
+            BL[0],BL[1],BL[2],  BR[0],BR[1],BR[2],
+            BR[0],BR[1],BR[2],  TR[0],TR[1],TR[2],
+            TR[0],TR[1],TR[2],  TL[0],TL[1],TL[2]
+        };
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza()
+        configurarBordePizza({
+            {TL[0],TL[1],TL[2]}, {BL[0],BL[1],BL[2]}, {BR[0],BR[1],BR[2]}, {TR[0],TR[1],TR[2]}
+        });
+    }
+};
+
+class Circulo : public Figura {
+public:
+    Circulo(int segmentos = 36, float radio = 0.5f) {
+        std::vector<float> relleno;
+        std::vector<Punto3D> borde;
+        for(int i = 0; i < segmentos; i++) {
+            float angulo1 = 2.0f * PI * i / segmentos;
+            float angulo2 = 2.0f * PI * (i + 1) / segmentos;
+            relleno.push_back(0.0f); relleno.push_back(0.0f); relleno.push_back(0.0f);
+            relleno.push_back(radio * cos(angulo1)); relleno.push_back(radio * sin(angulo1)); relleno.push_back(0.0f);
+            relleno.push_back(radio * cos(angulo2)); relleno.push_back(radio * sin(angulo2)); relleno.push_back(0.0f);
+            borde.push_back({radio * cosf(angulo1), radio * sinf(angulo1), 0.0f});
+        }
+        configurarMalla(relleno);
+
+        // Líneas = solo el borde circular (sin los radios/spokes al centro)
+        std::vector<float> lineas;
+        for (size_t i = 0; i < borde.size(); i++) {
+            Punto3D a = borde[i];
+            Punto3D b = borde[(i + 1) % borde.size()];
+            lineas.push_back(a.x); lineas.push_back(a.y); lineas.push_back(a.z);
+            lineas.push_back(b.x); lineas.push_back(b.y); lineas.push_back(b.z);
+        }
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza() (el mismo borde circular)
+        configurarBordePizza(borde);
+    }
+};
+
+// Trapecio (isósceles) — 4 vértices, 2 triángulos de relleno
+class Trapecio : public Figura {
+public:
+    Trapecio(float baseInferior = 1.0f, float baseSuperior = 0.5f, float altura = 0.6f) {
+        float bi = baseInferior / 2.0f;
+        float bs = baseSuperior / 2.0f;
+        float h  = altura / 2.0f;
+        float A[3] = {-bi, -h, 0.0f};
+        float B[3] = { bi, -h, 0.0f};
+        float C[3] = { bs,  h, 0.0f};
+        float D[3] = {-bs,  h, 0.0f};
+
+        std::vector<float> relleno = {
+            A[0],A[1],A[2],  B[0],B[1],B[2],  C[0],C[1],C[2],
+            A[0],A[1],A[2],  C[0],C[1],C[2],  D[0],D[1],D[2]
+        };
+        configurarMalla(relleno);
+
+        // Contorno real (4 aristas), sin la diagonal A-C del relleno
+        std::vector<float> lineas = {
+            A[0],A[1],A[2],  B[0],B[1],B[2],
+            B[0],B[1],B[2],  C[0],C[1],C[2],
+            C[0],C[1],C[2],  D[0],D[1],D[2],
+            D[0],D[1],D[2],  A[0],A[1],A[2]
+        };
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza()
+        configurarBordePizza({
+            {A[0],A[1],A[2]}, {B[0],B[1],B[2]}, {C[0],C[1],C[2]}, {D[0],D[1],D[2]}
+        });
+    }
+};
+
+// Rombo — 4 vértices, 2 triángulos de relleno
+class Rombo : public Figura {
+public:
+    Rombo(float diagonalHorizontal = 1.0f, float diagonalVertical = 0.7f) {
+        float dh = diagonalHorizontal / 2.0f;
+        float dv = diagonalVertical / 2.0f;
+        float Arriba[3]   = {0.0f,  dv, 0.0f};
+        float Izquierda[3]= {-dh, 0.0f, 0.0f};
+        float Abajo[3]    = {0.0f, -dv, 0.0f};
+        float Derecha[3]  = { dh, 0.0f, 0.0f};
+
+        std::vector<float> relleno = {
+            Arriba[0],Arriba[1],Arriba[2],  Izquierda[0],Izquierda[1],Izquierda[2],  Abajo[0],Abajo[1],Abajo[2],
+            Arriba[0],Arriba[1],Arriba[2],  Abajo[0],Abajo[1],Abajo[2],  Derecha[0],Derecha[1],Derecha[2]
+        };
+        configurarMalla(relleno);
+
+        // Contorno real (4 aristas), sin la diagonal Arriba-Abajo del relleno
+        std::vector<float> lineas = {
+            Arriba[0],Arriba[1],Arriba[2],   Izquierda[0],Izquierda[1],Izquierda[2],
+            Izquierda[0],Izquierda[1],Izquierda[2],  Abajo[0],Abajo[1],Abajo[2],
+            Abajo[0],Abajo[1],Abajo[2],      Derecha[0],Derecha[1],Derecha[2],
+            Derecha[0],Derecha[1],Derecha[2],Arriba[0],Arriba[1],Arriba[2]
+        };
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza()
+        configurarBordePizza({
+            {Arriba[0],Arriba[1],Arriba[2]}, {Izquierda[0],Izquierda[1],Izquierda[2]},
+            {Abajo[0],Abajo[1],Abajo[2]},    {Derecha[0],Derecha[1],Derecha[2]}
+        });
+    }
+};
+
+// Semicírculo — abanico de triángulos cubriendo 180°
+class Semicirculo : public Figura {
+public:
+    Semicirculo(int segmentos = 36, float radio = 0.5f) {
+        std::vector<float> relleno;
+        std::vector<Punto3D> arco;
+        for (int i = 0; i <= segmentos; i++) {
+            float ang = PI * i / segmentos;
+            arco.push_back({radio * cosf(ang), radio * sinf(ang), 0.0f});
+        }
+        for (int i = 0; i < segmentos; i++) {
+            relleno.push_back(0.0f); relleno.push_back(0.0f); relleno.push_back(0.0f);
+            relleno.push_back(arco[i].x);   relleno.push_back(arco[i].y);   relleno.push_back(arco[i].z);
+            relleno.push_back(arco[i+1].x); relleno.push_back(arco[i+1].y); relleno.push_back(arco[i+1].z);
+        }
+        configurarMalla(relleno);
+
+        // Líneas = arco curvo + el diámetro recto que cierra la figura
+        // (sin los radios internos hacia el centro que usa el relleno)
+        std::vector<float> lineas;
+        for (int i = 0; i < segmentos; i++) {
+            lineas.push_back(arco[i].x);   lineas.push_back(arco[i].y);   lineas.push_back(arco[i].z);
+            lineas.push_back(arco[i+1].x); lineas.push_back(arco[i+1].y); lineas.push_back(arco[i+1].z);
+        }
+        // Diámetro: del último punto del arco de vuelta al primero
+        lineas.push_back(arco[segmentos].x); lineas.push_back(arco[segmentos].y); lineas.push_back(arco[segmentos].z);
+        lineas.push_back(arco[0].x);         lineas.push_back(arco[0].y);         lineas.push_back(arco[0].z);
+        configurarLineas(lineas);
+
+        // Borde para la función convertirPizza(): el arco completo
+        // (el cierre con el diámetro queda implícito por el módulo)
+        configurarBordePizza(arco);
+    }
+};
+
+// --- PRIMITIVAS 3D ---
+
+// Piramide de base cuadrada — 5 caras: [0]=base, [1]=frontal, [2]=derecha,
+// [3]=trasera, [4]=izquierda (en ese orden, según se arman en el relleno).
+class Piramide : public Figura {
+public:
+    Piramide() {
+        float BA[3] = {-0.5f, -0.5f, -0.5f};
+        float BB[3] = { 0.5f, -0.5f, -0.5f};
+        float BC[3] = { 0.5f, -0.5f,  0.5f};
+        float BD[3] = {-0.5f, -0.5f,  0.5f};
+        float P[3]  = { 0.0f,  0.5f,  0.0f};
+
+        std::vector<float> relleno = {
+            // Base cuadrada (2 triángulos)                -> cara 0
+            BA[0],BA[1],BA[2],  BB[0],BB[1],BB[2],  BC[0],BC[1],BC[2],
+            BC[0],BC[1],BC[2],  BD[0],BD[1],BD[2],  BA[0],BA[1],BA[2],
+            // Cara Frontal                                -> cara 1
+            BD[0],BD[1],BD[2],  BC[0],BC[1],BC[2],  P[0],P[1],P[2],
+            // Cara Derecha                                -> cara 2
+            BC[0],BC[1],BC[2],  BB[0],BB[1],BB[2],  P[0],P[1],P[2],
+            // Cara Trasera                                -> cara 3
+            BB[0],BB[1],BB[2],  BA[0],BA[1],BA[2],  P[0],P[1],P[2],
+            // Cara Izquierda                              -> cara 4
+            BA[0],BA[1],BA[2],  BD[0],BD[1],BD[2],  P[0],P[1],P[2]
+        };
+        configurarMalla(relleno);
+
+        // Contorno real: 4 aristas de la base + 4 aristas hacia el ápice
+        // (sin la diagonal BA-BC que usa el relleno para la base)
+        auto E = [](std::vector<float>& out, const float* a, const float* b) {
+            out.push_back(a[0]); out.push_back(a[1]); out.push_back(a[2]);
+            out.push_back(b[0]); out.push_back(b[1]); out.push_back(b[2]);
+        };
+        std::vector<float> lineas;
+        E(lineas, BA, BB); E(lineas, BB, BC); E(lineas, BC, BD); E(lineas, BD, BA);
+        E(lineas, BA, P);  E(lineas, BB, P);  E(lineas, BC, P);  E(lineas, BD, P);
+        configurarLineas(lineas);
+
+        // Caras para cambiarColorCaras()/pintarCarasAleatorio():
+        // índice 0 = base (6 vértices), 1..4 = las 4 caras triangulares
+        // laterales (3 vértices cada una), en el mismo orden del relleno.
+        configurarCaras({6, 3, 3, 3, 3});
+    }
+};
+
+// Cubo — 6 caras, todas de 6 vértices (2 triángulos c/u):
+// [0]=Frontal, [1]=Trasera, [2]=Izquierda, [3]=Derecha, [4]=Inferior, [5]=Superior
+class Cubo : public Figura {
+public:
+    Cubo() {
+        float FTL[3] = {-0.5f,  0.5f,  0.5f}, FTR[3] = { 0.5f,  0.5f,  0.5f};
+        float FBR[3] = { 0.5f, -0.5f,  0.5f}, FBL[3] = {-0.5f, -0.5f,  0.5f};
+        float BTL[3] = {-0.5f,  0.5f, -0.5f}, BTR[3] = { 0.5f,  0.5f, -0.5f};
+        float BBR[3] = { 0.5f, -0.5f, -0.5f}, BBL[3] = {-0.5f, -0.5f, -0.5f};
+
+        std::vector<float> v = {
+            // Cara Frontal                                        -> cara 0
+            FBL[0],FBL[1],FBL[2],  FBR[0],FBR[1],FBR[2],  FTR[0],FTR[1],FTR[2],
+            FTR[0],FTR[1],FTR[2],  FTL[0],FTL[1],FTL[2],  FBL[0],FBL[1],FBL[2],
+            // Cara Trasera                                        -> cara 1
+            BBL[0],BBL[1],BBL[2],  BBR[0],BBR[1],BBR[2],  BTR[0],BTR[1],BTR[2],
+            BTR[0],BTR[1],BTR[2],  BTL[0],BTL[1],BTL[2],  BBL[0],BBL[1],BBL[2],
+            // Cara Izquierda                                      -> cara 2
+            FTL[0],FTL[1],FTL[2],  BTL[0],BTL[1],BTL[2],  BBL[0],BBL[1],BBL[2],
+            BBL[0],BBL[1],BBL[2],  FBL[0],FBL[1],FBL[2],  FTL[0],FTL[1],FTL[2],
+            // Cara Derecha                                        -> cara 3
+            FTR[0],FTR[1],FTR[2],  BTR[0],BTR[1],BTR[2],  BBR[0],BBR[1],BBR[2],
+            BBR[0],BBR[1],BBR[2],  FBR[0],FBR[1],FBR[2],  FTR[0],FTR[1],FTR[2],
+            // Cara Inferior                                       -> cara 4
+            BBL[0],BBL[1],BBL[2],  BBR[0],BBR[1],BBR[2],  FBR[0],FBR[1],FBR[2],
+            FBR[0],FBR[1],FBR[2],  FBL[0],FBL[1],FBL[2],  BBL[0],BBL[1],BBL[2],
+            // Cara Superior                                       -> cara 5
+            FTL[0],FTL[1],FTL[2],  FTR[0],FTR[1],FTR[2],  BTR[0],BTR[1],BTR[2],
+            BTR[0],BTR[1],BTR[2],  BTL[0],BTL[1],BTL[2],  FTL[0],FTL[1],FTL[2]
+        };
+        configurarMalla(v);
+
+        // Contorno real: las 12 aristas del cubo, SIN las diagonales que
+        // el relleno usa en cada cara para formar sus 2 triángulos.
+        auto E = [](std::vector<float>& out, const float* a, const float* b) {
+            out.push_back(a[0]); out.push_back(a[1]); out.push_back(a[2]);
+            out.push_back(b[0]); out.push_back(b[1]); out.push_back(b[2]);
+        };
+        std::vector<float> lineas;
+        E(lineas, FTL, FTR); E(lineas, FTR, FBR); E(lineas, FBR, FBL); E(lineas, FBL, FTL); // cara frontal
+        E(lineas, BTL, BTR); E(lineas, BTR, BBR); E(lineas, BBR, BBL); E(lineas, BBL, BTL); // cara trasera
+        E(lineas, FTL, BTL); E(lineas, FTR, BTR); E(lineas, FBR, BBR); E(lineas, FBL, BBL); // aristas que unen
+        configurarLineas(lineas);
+
+        // Caras para cambiarColorCaras()/pintarCarasAleatorio(): 6 caras,
+        // cada una con 6 vértices (2 triángulos), en el orden de arriba:
+        // Frontal, Trasera, Izquierda, Derecha, Inferior, Superior.
+        configurarCaras({6, 6, 6, 6, 6, 6});
+    }
+};
+
+// Esfera — sus "caras" para cambiarColorCaras() son bandas de latitud
+// completas (como los husos/franjas horizontales de un globo terráqueo):
+// cara 0 = la franja más cercana al polo sur, cara (paralelos-1) = la más
+// cercana al polo norte. Cada franja está hecha de "meridianos" cuadros
+// (2 triángulos = 6 vértices cada uno), así que ocupa meridianos*6
+// vértices dentro del buffer de relleno.
+class Esfera : public Figura {
+public:
+    Esfera(float radio = 0.5f, int paralelos = 20, int meridianos = 20) {
+        std::vector<float> relleno;
+        for(int i = 0; i < paralelos; ++i) {
+            float lat0 = PI * (-0.5f + (float)(i) / paralelos);
+            float z0  = sin(lat0)*radio;
+            float zr0 = cos(lat0)*radio;
+
+            float lat1 = PI * (-0.5f + (float)(i+1) / paralelos);
+            float z1 = sin(lat1)*radio;
+            float zr1 = cos(lat1)*radio;
+
+            for(int j = 0; j < meridianos; ++j) {
+                float lng0 = 2 * PI * (float)(j) / meridianos;
+                float x0 = cos(lng0);
+                float y0 = sin(lng0);
+
+                float lng1 = 2 * PI * (float)(j+1) / meridianos;
+                float x1 = cos(lng1);
+                float y1 = sin(lng1);
+
+                relleno.push_back(x0*zr0); relleno.push_back(y0*zr0); relleno.push_back(z0);
+                relleno.push_back(x1*zr0); relleno.push_back(y1*zr0); relleno.push_back(z0);
+                relleno.push_back(x0*zr1); relleno.push_back(y0*zr1); relleno.push_back(z1);
+
+                relleno.push_back(x1*zr0); relleno.push_back(y1*zr0); relleno.push_back(z0);
+                relleno.push_back(x1*zr1); relleno.push_back(y1*zr1); relleno.push_back(z1);
+                relleno.push_back(x0*zr1); relleno.push_back(y0*zr1); relleno.push_back(z1);
+            }
+        }
+        configurarMalla(relleno);
+
+        // Líneas = una grilla real de paralelos (latitud) y meridianos
+        // (longitud), como un globo terráqueo, en vez de la diagonal de
+        // cada triángulo de relleno.
+        auto punto = [&](int i, int j) -> Punto3D {
+            float lat = PI * (-0.5f + (float)i / paralelos);
+            float lng = 2 * PI * (float)j / meridianos;
+            float zr = cos(lat) * radio;
+            float z  = sin(lat) * radio;
+            return { cos(lng) * zr, sin(lng) * zr, z };
+        };
+        std::vector<float> lineas;
+        auto E = [&](Punto3D a, Punto3D b) {
+            lineas.push_back(a.x); lineas.push_back(a.y); lineas.push_back(a.z);
+            lineas.push_back(b.x); lineas.push_back(b.y); lineas.push_back(b.z);
+        };
+        // Anillos de latitud (se saltan los polos, i=0 e i=paralelos, porque
+        // ahí el anillo tiene radio 0 y no se ve nada)
+        for (int i = 1; i < paralelos; i++) {
+            for (int j = 0; j < meridianos; j++) {
+                E(punto(i, j), punto(i, (j + 1) % meridianos));
+            }
+        }
+        // Líneas de meridiano (de polo a polo)
+        for (int j = 0; j < meridianos; j++) {
+            for (int i = 0; i < paralelos; i++) {
+                E(punto(i, j), punto(i + 1, j));
+            }
+        }
+        configurarLineas(lineas);
+
+        // Caras para cambiarColorCaras(): una por cada franja de latitud
+        // (en el mismo orden en que el bucle de arriba las va generando,
+        // de polo sur a polo norte), cada una con meridianos*6 vértices.
+        std::vector<int> caras;
+        for (int i = 0; i < paralelos; i++) caras.push_back(meridianos * 6);
+        configurarCaras(caras);
+    }
+};
+
+// Cilindro — tapa superior, tapa inferior y superficie lateral.
+// Sus "caras" para cambiarColorCaras() van de 3 en 3 por cada segmento i:
+//   cara (3*i+0) = triángulo de la tapa SUPERIOR del segmento i
+//   cara (3*i+1) = triángulo de la tapa INFERIOR del segmento i
+//   cara (3*i+2) = el panel LATERAL (rectángulo) del segmento i
+class Cilindro : public Figura {
+public:
+    Cilindro(float radio = 0.5f, float altura = 1.0f, int segmentos = 36) {
+        std::vector<float> relleno;
+        float h = altura / 2.0f;
+        std::vector<Punto3D> top, bottom;
+        for (int i = 0; i < segmentos; i++) {
+            float a0 = 2.0f * PI * i / segmentos;
+            float a1 = 2.0f * PI * (i + 1) / segmentos;
+            float x0 = radio * cos(a0), z0 = radio * sin(a0);
+            float x1 = radio * cos(a1), z1 = radio * sin(a1);
+
+            relleno.push_back(0.0f); relleno.push_back(h); relleno.push_back(0.0f);
+            relleno.push_back(x0);   relleno.push_back(h); relleno.push_back(z0);
+            relleno.push_back(x1);   relleno.push_back(h); relleno.push_back(z1);
+
+            relleno.push_back(0.0f); relleno.push_back(-h); relleno.push_back(0.0f);
+            relleno.push_back(x1);   relleno.push_back(-h); relleno.push_back(z1);
+            relleno.push_back(x0);   relleno.push_back(-h); relleno.push_back(z0);
+
+            relleno.push_back(x0); relleno.push_back(h);  relleno.push_back(z0);
+            relleno.push_back(x0); relleno.push_back(-h); relleno.push_back(z0);
+            relleno.push_back(x1); relleno.push_back(-h); relleno.push_back(z1);
+
+            relleno.push_back(x0); relleno.push_back(h);  relleno.push_back(z0);
+            relleno.push_back(x1); relleno.push_back(-h); relleno.push_back(z1);
+            relleno.push_back(x1); relleno.push_back(h);  relleno.push_back(z1);
+
+            top.push_back({x0, h, z0});
+            bottom.push_back({x0, -h, z0});
+        }
+        configurarMalla(relleno);
+
+        // Líneas = círculo superior + círculo inferior + unas pocas
+        // verticales (aristas reales de la "silueta" del cilindro), sin
+        // triangular ni rellenar nada.
+        std::vector<float> lineas;
+        auto E = [&](Punto3D a, Punto3D b) {
+            lineas.push_back(a.x); lineas.push_back(a.y); lineas.push_back(a.z);
+            lineas.push_back(b.x); lineas.push_back(b.y); lineas.push_back(b.z);
+        };
+        for (int i = 0; i < segmentos; i++) {
+            E(top[i], top[(i + 1) % segmentos]);
+            E(bottom[i], bottom[(i + 1) % segmentos]);
+        }
+        int verticales = 8; // cantidad de líneas verticales a mostrar
+        int paso = std::max(1, segmentos / verticales);
+        for (int i = 0; i < segmentos; i += paso) {
+            E(top[i], bottom[i]);
+        }
+        configurarLineas(lineas);
+
+        // Caras para cambiarColorCaras(): por cada segmento se generaron,
+        // en este orden, 3 vértices de la tapa superior, 3 de la tapa
+        // inferior y 6 del panel lateral (2 triángulos) -> 3 "caras" por
+        // segmento: {3, 3, 6}.
+        std::vector<int> caras;
+        for (int i = 0; i < segmentos; i++) {
+            caras.push_back(3); // tapa superior de este segmento
+            caras.push_back(3); // tapa inferior de este segmento
+            caras.push_back(6); // panel lateral de este segmento
+        }
+        configurarCaras(caras);
+    }
+};
+
+// Cono — base circular y superficie lateral hacia una punta.
+// Sus "caras" para cambiarColorCaras() van de 2 en 2 por cada segmento i:
+//   cara (2*i+0) = triángulo de la BASE del segmento i
+//   cara (2*i+1) = triángulo LATERAL (hacia el ápice) del segmento i
+class Cono : public Figura {
+public:
+    Cono(float radio = 0.5f, float altura = 1.0f, int segmentos = 36) {
+        std::vector<float> relleno;
+        float h = altura / 2.0f;
+        std::vector<Punto3D> base;
+        Punto3D apice = {0.0f, h, 0.0f};
+        for (int i = 0; i < segmentos; i++) {
+            float a0 = 2.0f * PI * i / segmentos;
+            float a1 = 2.0f * PI * (i + 1) / segmentos;
+            float x0 = radio * cos(a0), z0 = radio * sin(a0);
+            float x1 = radio * cos(a1), z1 = radio * sin(a1);
+
+            relleno.push_back(0.0f); relleno.push_back(-h); relleno.push_back(0.0f);
+            relleno.push_back(x1);   relleno.push_back(-h); relleno.push_back(z1);
+            relleno.push_back(x0);   relleno.push_back(-h); relleno.push_back(z0);
+
+            relleno.push_back(apice.x); relleno.push_back(apice.y); relleno.push_back(apice.z);
+            relleno.push_back(x0);      relleno.push_back(-h);      relleno.push_back(z0);
+            relleno.push_back(x1);      relleno.push_back(-h);      relleno.push_back(z1);
+
+            base.push_back({x0, -h, z0});
+        }
+        configurarMalla(relleno);
+
+        // Líneas = círculo de la base + unas pocas líneas hacia el ápice
+        // (aristas reales de la silueta), sin diagonales de relleno.
+        std::vector<float> lineas;
+        auto E = [&](Punto3D a, Punto3D b) {
+            lineas.push_back(a.x); lineas.push_back(a.y); lineas.push_back(a.z);
+            lineas.push_back(b.x); lineas.push_back(b.y); lineas.push_back(b.z);
+        };
+        for (int i = 0; i < segmentos; i++) {
+            E(base[i], base[(i + 1) % segmentos]);
+        }
+        int lineasApice = 8; // cantidad de líneas hacia la punta a mostrar
+        int paso = std::max(1, segmentos / lineasApice);
+        for (int i = 0; i < segmentos; i += paso) {
+            E(base[i], apice);
+        }
+        configurarLineas(lineas);
+
+        // Caras para cambiarColorCaras(): por cada segmento se generaron,
+        // en este orden, 3 vértices de la base y 3 del triángulo lateral
+        // -> 2 "caras" por segmento: {3, 3}.
+        std::vector<int> caras;
+        for (int i = 0; i < segmentos; i++) {
+            caras.push_back(3); // base de este segmento
+            caras.push_back(3); // lateral de este segmento (hacia el ápice)
+        }
+        configurarCaras(caras);
+    }
+};
+
+// =========================================================================
+// =========================================================================
+//                         *** TODO LO DE AQUÍ ABAJO ES NUEVO ***
+// =========================================================================
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// 5. UTILIDADES DE VECTORES (para no depender de librerías externas)
+// -------------------------------------------------------------------------
+inline Punto3D vSumar(Punto3D a, Punto3D b)    { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+inline Punto3D vRestar(Punto3D a, Punto3D b)   { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+inline float   vPunto(Punto3D a, Punto3D b)    { return a.x * b.x + a.y * b.y + a.z * b.z; }
+inline Punto3D vCruz(Punto3D a, Punto3D b)     { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+inline float   vLongitud(Punto3D a)            { return sqrtf(vPunto(a, a)); }
+inline Punto3D vNormalizar(Punto3D a) {
+    float l = vLongitud(a);
+    if (l < 1e-8f) return {0.0f, 0.0f, 0.0f};
+    return {a.x / l, a.y / l, a.z / l};
+}
+// Rotar un punto alrededor del eje Z / Y (en grados)
+inline Punto3D vRotarZ(Punto3D p, float grados) {
+    float r = grados * PI / 180.0f, c = cosf(r), s = sinf(r);
+    return {p.x * c - p.y * s, p.x * s + p.y * c, p.z};
+}
+inline Punto3D vRotarY(Punto3D p, float grados) {
+    float r = grados * PI / 180.0f, c = cosf(r), s = sinf(r);
+    return {p.x * c + p.z * s, p.y, -p.x * s + p.z * c};
+}
+
+// -------------------------------------------------------------------------
+// 6. CÁMARA
+// -------------------------------------------------------------------------
+// Cámara con posición, punto al que mira (objetivo), vector "arriba" y
+// perspectiva. Sube al shader las matrices "vista" y "proyeccion" cada vez
+// que llamas a aplicar(). La proporción de la ventana se pasa como
+// argumento (usa la global g_aspecto) para que los círculos sean círculos.
+//
+// Por defecto está en (0, 1, 4.5) mirando al origen: ahí caben cómodamente
+// figuras de tamaño ~1 (rango aproximado x∈[-1.9,1.9], y∈[-1.5,1.5]).
+// Las figuras 2D funcionan igual: son planos en z=0 dentro del mundo 3D.
+class Camara {
+private:
+    unsigned int shaderID;
+    int vistaLoc, proyLoc;
+public:
+    Punto3D posicion = {0.0f, 1.0f, 4.5f};
+    Punto3D objetivo = {0.0f, 0.0f, 0.0f};
+    Punto3D arriba   = {0.0f, 1.0f, 0.0f};
+    float fov   = 45.0f;   // campo de visión vertical en grados
+    float cerca = 0.1f;
+    float lejos = 100.0f;
+
+    Camara(unsigned int shaderProgram) {
+        shaderID = shaderProgram;
+        vistaLoc = glGetUniformLocation(shaderID, "vista");
+        proyLoc  = glGetUniformLocation(shaderID, "proyeccion");
+    }
+
+    void establecerPosicion(float x, float y, float z) { posicion = {x, y, z}; }
+    void mirarA(float x, float y, float z)             { objetivo = {x, y, z}; }
+    void establecerArriba(float x, float y, float z)   { arriba = {x, y, z}; }
+
+    // Vuelve a la posición/orientación por defecto
+    void reiniciar() {
+        posicion = {0.0f, 1.0f, 4.5f};
+        objetivo = {0.0f, 0.0f, 0.0f};
+        arriba   = {0.0f, 1.0f, 0.0f};
+    }
+
+    // Calcula vista + proyección y las sube al shader (filas primero,
+    // se suben con GL_TRUE igual que en Transformador3D).
+    void aplicar(float aspecto) {
+        // ----- Vista (lookAt) -----
+        Punto3D f = vRestar(objetivo, posicion);
+        if (vLongitud(f) < 1e-6f) f = {0.0f, 0.0f, -1.0f}; // cámara justo sobre el objetivo
+        f = vNormalizar(f);
+
+        Punto3D up = arriba;
+        Punto3D s = vCruz(f, up);
+        if (vLongitud(s) < 1e-6f) {
+            // "arriba" paralelo a la mirada: se elige otro vector arriba
+            up = (fabsf(f.y) > 0.99f) ? Punto3D{0.0f, 0.0f, -1.0f} : Punto3D{0.0f, 1.0f, 0.0f};
+            s = vCruz(f, up);
+        }
+        s = vNormalizar(s);
+        Punto3D u = vCruz(s, f);
+
+        float vista[16] = {
+             s.x,  s.y,  s.z, -vPunto(s, posicion),
+             u.x,  u.y,  u.z, -vPunto(u, posicion),
+            -f.x, -f.y, -f.z,  vPunto(f, posicion),
+             0.0f, 0.0f, 0.0f, 1.0f
+        };
+
+        // ----- Proyección en perspectiva -----
+        float t = 1.0f / tanf(fov * PI / 360.0f);
+        float proy[16] = {
+            t / aspecto, 0.0f, 0.0f, 0.0f,
+            0.0f, t, 0.0f, 0.0f,
+            0.0f, 0.0f, (lejos + cerca) / (cerca - lejos), (2.0f * lejos * cerca) / (cerca - lejos),
+            0.0f, 0.0f, -1.0f, 0.0f
+        };
+
+        glUseProgram(shaderID);
+        glUniformMatrix4fv(vistaLoc, 1, GL_TRUE, vista);
+        glUniformMatrix4fv(proyLoc,  1, GL_TRUE, proy);
+    }
+};
+
+// -------------------------------------------------------------------------
+// 7. OBJETIVO: el centro alrededor del cual se orbita
+// -------------------------------------------------------------------------
+// Puede ser:
+//   - un punto fijo:        Objetivo(0, 0, 0)  u  Objetivo(Punto3D{...})
+//   - una figura (que se mueve): Objetivo(sol)  -> usa sol.obtenerPosicion()
+//     cada vez que se pide, así que si la figura se mueve, el centro de la
+//     órbita se mueve con ella (siempre que actualices su posición).
+struct Objetivo {
+    Punto3D fijo = {0.0f, 0.0f, 0.0f};
+    const Figura* figura = nullptr;
+
+    Objetivo(Punto3D p) : fijo(p) {}
+    Objetivo(float x, float y, float z) : fijo{x, y, z} {}
+    Objetivo(const Figura& f) : figura(&f) {}
+
+    Punto3D obtener() const { return figura ? figura->obtenerPosicion() : fijo; }
+};
+
+// -------------------------------------------------------------------------
+// 8. TIPOS DE ÓRBITA / ESPIRAL Y SUS PARÁMETROS
+// -------------------------------------------------------------------------
+// Convencional      : círculo horizontal (plano XZ) alrededor del objetivo.
+// DiagonalIzquierda : ese círculo inclinado con el lado izquierdo ARRIBA.
+// DiagonalDerecha   : ese círculo inclinado con el lado derecho ARRIBA.
+// Medio             : aro VERTICAL que pasa por encima, por delante, por
+//                     debajo y por detrás del objetivo (órbita "polar").
+enum class TipoOrbita { Convencional, DiagonalIzquierda, DiagonalDerecha, Medio };
+
+// Normal            : espiral plana horizontal (el radio va cambiando).
+// DiagonalIzquierda : la misma espiral en un plano inclinado a la izquierda.
+// DiagonalDerecha   : la misma espiral en un plano inclinado a la derecha.
+// Arriba            : hélice que sube por el eje Y mientras da vueltas.
+enum class TipoEspiral { Normal, DiagonalIzquierda, DiagonalDerecha, Arriba };
+
+// Parámetros de forma opcionales (valores por defecto razonables)
+struct ParamsOrbita {
+    float inclinacion = 45.0f; // grados de inclinación de las órbitas/espirales diagonales
+    float anguloAro   = 30.0f; // giro (grados, sobre el eje Y) del aro vertical de "Medio":
+                               //   0  -> aro de perfil (plano YZ, se ve como una línea vertical de frente)
+                               //   90 -> aro de frente (plano XY, se ve como círculo completo de frente)
+};
+
+// ---- Configuración completa de una ÓRBITA -----------------------------
+//   tipo      : cuál de los 4 tipos de órbita
+//   centro    : Objetivo (punto o figura)
+//   radio     : distancia al centro
+//   velocidad : grados por segundo (negativo = gira al revés)
+//   fase      : ángulo inicial en grados (sirve para desfasar figuras)
+//   params    : inclinación / ángulo del aro
+struct ConfigOrbita {
+    TipoOrbita tipo;
+    Objetivo centro;
+    float radio;
+    float velocidad;
+    float fase;
+    ParamsOrbita params;
+
+    ConfigOrbita(TipoOrbita t, Objetivo c, float r, float vel = 60.0f, float f = 0.0f,
+                 ParamsOrbita p = ParamsOrbita())
+        : tipo(t), centro(c), radio(r), velocidad(vel), fase(f), params(p) {}
+};
+
+// ---- Configuración completa de una ESPIRAL ----------------------------
+//   radioInicial -> radioFinal : el radio va cambiando linealmente
+//   vueltas      : cuántas vueltas da de principio a fin
+//   alturaTotal  : solo para TipoEspiral::Arriba (sube alturaTotal en total,
+//                  centrada en el objetivo: de -alturaTotal/2 a +alturaTotal/2)
+//   velocidad    : grados por segundo
+// Al terminar todas las vueltas la espiral REINICIA desde el principio.
+struct ConfigEspiral {
+    TipoEspiral tipo;
+    Objetivo centro;
+    float radioInicial;
+    float radioFinal;
+    float vueltas;
+    float alturaTotal;
+    float velocidad;
+    float fase;
+    ParamsOrbita params;
+
+    ConfigEspiral(TipoEspiral t, Objetivo c, float rIni, float rFin, float v = 3.0f,
+                  float altura = 0.0f, float vel = 90.0f, float f = 0.0f,
+                  ParamsOrbita p = ParamsOrbita())
+        : tipo(t), centro(c), radioInicial(rIni), radioFinal(rFin), vueltas(v),
+          alturaTotal(altura), velocidad(vel), fase(f), params(p) {}
+};
+
+// -------------------------------------------------------------------------
+// 9. MATEMÁTICA INTERNA (posición y vector "arriba" según el tipo)
+// -------------------------------------------------------------------------
+// Punto de la órbita RELATIVO al centro
+inline Punto3D puntoOrbita(TipoOrbita tipo, float radio, float angGrados, const ParamsOrbita& p) {
+    float a = angGrados * PI / 180.0f;
+    float c = cosf(a), s = sinf(a);
+    switch (tipo) {
+        case TipoOrbita::Convencional:
+            return {radio * c, 0.0f, radio * s};
+        case TipoOrbita::DiagonalIzquierda:
+            return vRotarZ({radio * c, 0.0f, radio * s}, -p.inclinacion);
+        case TipoOrbita::DiagonalDerecha:
+            return vRotarZ({radio * c, 0.0f, radio * s}, p.inclinacion);
+        case TipoOrbita::Medio:
+            return vRotarY({0.0f, radio * c, radio * s}, p.anguloAro);
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
+// Vector "arriba" que usa la cámara mientras orbita, para que no se
+// voltee de forma brusca. En "Medio" gira junto con el aro (hace un
+// looping suave pasando por encima y por debajo del objetivo).
+inline Punto3D arribaOrbita(TipoOrbita tipo, float angGrados, const ParamsOrbita& p) {
+    switch (tipo) {
+        case TipoOrbita::Convencional:      return {0.0f, 1.0f, 0.0f};
+        case TipoOrbita::DiagonalIzquierda: return vRotarZ({0.0f, 1.0f, 0.0f}, -p.inclinacion);
+        case TipoOrbita::DiagonalDerecha:   return vRotarZ({0.0f, 1.0f, 0.0f},  p.inclinacion);
+        case TipoOrbita::Medio: {
+            Punto3D t = puntoOrbita(TipoOrbita::Medio, 1.0f, angGrados + 90.0f, p);
+            return {-t.x, -t.y, -t.z};
+        }
+    }
+    return {0.0f, 1.0f, 0.0f};
+}
+
+// Estado de una espiral en un instante dado
+struct EstadoEspiral { float angulo, radio, altura; };
+
+inline EstadoEspiral calcularEstadoEspiral(const ConfigEspiral& c, float tiempo) {
+    float vueltas = (c.vueltas > 0.0f) ? c.vueltas : 1.0f;
+    float total = 360.0f * vueltas;
+    float a = fmodf(tiempo * c.velocidad + c.fase, total);
+    if (a < 0.0f) a += total;
+    float progreso = a / total;                                  // 0..1, luego REINICIA
+    float radio  = c.radioInicial + (c.radioFinal - c.radioInicial) * progreso;
+    float altura = c.alturaTotal * (progreso - 0.5f);
+    return {a, radio, altura};
+}
+
+inline Punto3D puntoEspiral(TipoEspiral tipo, float radio, float angGrados, float altura,
+                            const ParamsOrbita& p) {
+    float a = angGrados * PI / 180.0f;
+    float c = cosf(a), s = sinf(a);
+    switch (tipo) {
+        case TipoEspiral::Normal:
+            return {radio * c, 0.0f, radio * s};
+        case TipoEspiral::DiagonalIzquierda:
+            return vRotarZ({radio * c, 0.0f, radio * s}, -p.inclinacion);
+        case TipoEspiral::DiagonalDerecha:
+            return vRotarZ({radio * c, 0.0f, radio * s}, p.inclinacion);
+        case TipoEspiral::Arriba:
+            return {radio * c, altura, radio * s};
+    }
+    return {0.0f, 0.0f, 0.0f};
+}
+
+inline Punto3D arribaEspiral(TipoEspiral tipo, const ParamsOrbita& p) {
+    switch (tipo) {
+        case TipoEspiral::DiagonalIzquierda: return vRotarZ({0.0f, 1.0f, 0.0f}, -p.inclinacion);
+        case TipoEspiral::DiagonalDerecha:   return vRotarZ({0.0f, 1.0f, 0.0f},  p.inclinacion);
+        default:                             return {0.0f, 1.0f, 0.0f};
+    }
+}
+
+// -------------------------------------------------------------------------
+// 10. FUNCIONES DE ÓRBITA
+// -------------------------------------------------------------------------
+// Todas devuelven la posición mundial resultante del objeto (o de la
+// cámara, según el caso).
+//
+// IMPORTANTE (objetos): estas funciones NO llaman a reiniciar() ni a
+// aplicar(). Haz tú:
+//     transformador.reiniciar();
+//     orbitarObjeto(transformador, cfg, tiempo, &figura);
+//     transformador.rotarY(...);  transformador.escalar(...);   // opcional
+//     transformador.aplicar();
+//     figura.dibujar...();
+// Si pasas &figura (opcional), también se actualiza figura.posicion para
+// que otras figuras o la cámara puedan orbitarla (Objetivo(figura)).
+// Funciona igual con figuras 2D y 3D.
+
+// --- Solo OBJETOS ---
+inline Punto3D orbitarObjeto(Transformador3D& t, const ConfigOrbita& cfg, float tiempo,
+                             Figura* figura = nullptr) {
+    float ang = tiempo * cfg.velocidad + cfg.fase;
+    Punto3D pos = vSumar(cfg.centro.obtener(), puntoOrbita(cfg.tipo, cfg.radio, ang, cfg.params));
+    t.trasladar(pos.x, pos.y, pos.z);
+    if (figura) figura->establecerPosicion(pos);
+    return pos;
+}
+
+// --- Solo CÁMARA (la cámara orbita y siempre mira al centro) ---
+inline Punto3D orbitarCamara(Camara& cam, const ConfigOrbita& cfg, float tiempo) {
+    float ang = tiempo * cfg.velocidad + cfg.fase;
+    Punto3D centro = cfg.centro.obtener();
+    Punto3D pos = vSumar(centro, puntoOrbita(cfg.tipo, cfg.radio, ang, cfg.params));
+    cam.posicion = pos;
+    cam.objetivo = centro;
+    cam.arriba   = arribaOrbita(cfg.tipo, ang, cfg.params);
+    return pos;
+}
+
+// --- AMBOS: objeto y cámara, cada uno con su propia configuración ---
+// Primero mueve el objeto (y actualiza su posición) y luego la cámara,
+// así la cámara puede tener como centro Objetivo(figura) y seguir al objeto.
+inline Punto3D orbitarAmbos(Camara& cam, Transformador3D& t, const ConfigOrbita& cfgObjeto,
+                            const ConfigOrbita& cfgCamara, float tiempo, Figura* figura = nullptr) {
+    Punto3D posObjeto = orbitarObjeto(t, cfgObjeto, tiempo, figura);
+    orbitarCamara(cam, cfgCamara, tiempo);
+    return posObjeto;
+}
+
+// -------------------------------------------------------------------------
+// 11. FUNCIONES DE ESPIRAL (igual que las de órbita, pero el radio cambia
+//     de radioInicial a radioFinal y, al terminar las vueltas, reinicia)
+// -------------------------------------------------------------------------
+inline Punto3D espiralObjeto(Transformador3D& t, const ConfigEspiral& cfg, float tiempo,
+                             Figura* figura = nullptr) {
+    EstadoEspiral e = calcularEstadoEspiral(cfg, tiempo);
+    Punto3D pos = vSumar(cfg.centro.obtener(), puntoEspiral(cfg.tipo, e.radio, e.angulo, e.altura, cfg.params));
+    t.trasladar(pos.x, pos.y, pos.z);
+    if (figura) figura->establecerPosicion(pos);
+    return pos;
+}
+
+inline Punto3D espiralCamara(Camara& cam, const ConfigEspiral& cfg, float tiempo) {
+    EstadoEspiral e = calcularEstadoEspiral(cfg, tiempo);
+    Punto3D centro = cfg.centro.obtener();
+    Punto3D pos = vSumar(centro, puntoEspiral(cfg.tipo, e.radio, e.angulo, e.altura, cfg.params));
+    cam.posicion = pos;
+    cam.objetivo = centro;
+    cam.arriba   = arribaEspiral(cfg.tipo, cfg.params);
+    return pos;
+}
+
+inline Punto3D espiralAmbos(Camara& cam, Transformador3D& t, const ConfigEspiral& cfgObjeto,
+                            const ConfigEspiral& cfgCamara, float tiempo, Figura* figura = nullptr) {
+    Punto3D posObjeto = espiralObjeto(t, cfgObjeto, tiempo, figura);
+    espiralCamara(cam, cfgCamara, tiempo);
+    return posObjeto;
+}
+
+// =========================================================================
+// MAIN - DEMO DE ÓRBITAS Y ESPIRALES
+// =========================================================================
+// Escena: Sol (esfera, centro) - Planeta (cubo) - Luna (pirámide) que orbita
+// al planeta - Triángulo 2D que orbita al sol.
+//
+// CONTROLES:
+//   1 / 2 / 3 / 4 : tipo de órbita/espiral
+//                   Órbitas : 1 Convencional, 2 Diag. Izq, 3 Diag. Der, 4 Medio (aro vertical)
+//                   Espirales: 1 Normal,      2 Diag. Izq, 3 Diag. Der, 4 Arriba
+//   M             : cambia el modo de movimiento:
+//                   0 orbitarObjeto   1 orbitarCamara   2 orbitarAmbos
+//                   3 espiralObjeto   4 espiralCamara   5 espiralAmbos
+//   ESC           : salir
+int main()
+{
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "OpenGL - Orbitas y Espirales", NULL, NULL);
+    if (!window) { glfwTerminate(); return -1; }
+    glfwMakeContextCurrent(window);
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
+
+    if (!gladLoadGL(glfwGetProcAddress)) return -1;
+    glEnable(GL_DEPTH_TEST); // Vital para 3D (Esfera, Cubo, Pirámide, Cilindro, Cono)
+
+    // Compilación de Shaders
+    unsigned int vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
+    glCompileShader(vertexShader);
+
+    unsigned int fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
+    glCompileShader(fragmentShader);
+
+    unsigned int shaderProgram = glCreateProgram();
+    glAttachShader(shaderProgram, vertexShader);
+    glAttachShader(shaderProgram, fragmentShader);
+    glLinkProgram(shaderProgram);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    // [MODIFICADO] Las figuras y el bucle viven dentro de este bloque { }
+    // para que sus destructores (que llaman a glDelete*) se ejecuten ANTES
+    // de glfwTerminate(), mientras el contexto OpenGL todavía existe.
+    {
+        Transformador3D transformador(shaderProgram);   // sol, luna, triángulo
+        Transformador3D tPlaneta(shaderProgram);        // planeta (se calcula antes de dibujar)
+        GestorColor gestorColor(shaderProgram);
+        Camara camara(shaderProgram);
+
+        // FIGURAS
+        Esfera sol;
+        Cubo planeta;
+        Piramide luna;
+        Triangulo triangulo;   // figura 2D
+        sol.establecerPosicion(0.0f, 0.0f, 0.0f);
+
+        // Mapas de colores por cara (igual que antes)
+        std::map<int, NombreColor> coloresCubo = {
+            {0, NombreColor::Rojo},      // frontal, roja
+            {5, NombreColor::Blanco},    // superior, blanca
+            {2, NombreColor::Violeta}    // izquierda, violeta
+        };
+        std::map<int, NombreColor> coloresPiramide = {
+            {0, NombreColor::Marron},
+            {2, NombreColor::Rojo}
+        };
+
+        int tipoIdx = 0;   // 0..3 (1..4 en teclado)
+        int modo = 0;      // 0..5
+        const char* nombresModo[6] = {
+            "orbitarObjeto", "orbitarCamara", "orbitarAmbos",
+            "espiralObjeto", "espiralCamara", "espiralAmbos"
+        };
+        const char* nombresOrbita[4]  = {"Convencional", "DiagonalIzquierda", "DiagonalDerecha", "Medio (aro vertical)"};
+        const char* nombresEspiral[4] = {"Normal", "DiagonalIzquierda", "DiagonalDerecha", "Arriba"};
+
+        // Detección de "tecla recién pulsada" (una vez por pulsación)
+        static bool previas[GLFW_KEY_LAST + 1] = {false};
+        auto pulsada = [&](int k) {
+            bool ahora = glfwGetKey(window, k) == GLFW_PRESS;
+            bool r = ahora && !previas[k];
+            previas[k] = ahora;
+            return r;
+        };
+
+        cout << "Controles: 1-4 tipo | M modo | ESC salir" << endl;
+        cout << "Modo: " << nombresModo[modo] << " | Tipo: " << nombresOrbita[tipoIdx] << endl;
+
+        while (!glfwWindowShouldClose(window))
+        {
+            processInput(window);
+
+            bool cambio = false;
+            if (pulsada(GLFW_KEY_1)) { tipoIdx = 0; cambio = true; }
+            if (pulsada(GLFW_KEY_2)) { tipoIdx = 1; cambio = true; }
+            if (pulsada(GLFW_KEY_3)) { tipoIdx = 2; cambio = true; }
+            if (pulsada(GLFW_KEY_4)) { tipoIdx = 3; cambio = true; }
+            if (pulsada(GLFW_KEY_M)) { modo = (modo + 1) % 6; cambio = true; }
+            if (cambio) {
+                bool esEspiral = (modo >= 3);
+                cout << "Modo: " << nombresModo[modo] << " | Tipo: "
+                     << (esEspiral ? nombresEspiral[tipoIdx] : nombresOrbita[tipoIdx]) << endl;
+            }
+
+            glClearColor(0.15f, 0.15f, 0.15f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+            float tiempo = (float)glfwGetTime();
+
+            // Los enums tienen el mismo orden, así que se convierte el índice
+            TipoOrbita  tOrb = static_cast<TipoOrbita>(tipoIdx);
+            TipoEspiral tEsp = static_cast<TipoEspiral>(tipoIdx);
+
+            // ---------------- CONFIGURACIONES ----------------
+            // Órbitas
+            ConfigOrbita orbPlaneta(tOrb, Objetivo(sol), 1.3f, 60.0f);
+            ConfigOrbita orbTriang (tOrb, Objetivo(sol), 2.0f, 40.0f, 180.0f);
+            ConfigOrbita orbCamara (tOrb, Objetivo(sol), 4.5f, 30.0f);
+            // Espirales: radio 0.5 -> 1.8, 3 vueltas, sube 1.5 (solo tipo Arriba)
+            ConfigEspiral espPlaneta(tEsp, Objetivo(sol), 0.5f, 1.8f, 3.0f, 1.5f, 90.0f);
+            ConfigEspiral espTriang (tEsp, Objetivo(sol), 0.8f, 2.2f, 3.0f, 1.0f, 90.0f, 540.0f);
+            ConfigEspiral espCamara (tEsp, Objetivo(sol), 5.0f, 3.0f, 2.0f, 3.0f, 60.0f);
+
+            // La cámara vuelve a su posición por defecto en cada frame;
+            // si el modo la mueve, las funciones la sobrescriben.
+            camara.reiniciar();
+
+            // ---------------- PLANETA (cubo, 3D) ----------------
+            tPlaneta.reiniciar();
+            switch (modo) {
+                case 0: orbitarObjeto(tPlaneta, orbPlaneta, tiempo, &planeta); break;
+                case 1: orbitarCamara(camara, orbCamara, tiempo);
+                        planeta.establecerPosicion(1.3f, 0.0f, 0.0f);
+                        tPlaneta.trasladar(1.3f, 0.0f, 0.0f); break;
+                case 2: orbitarAmbos(camara, tPlaneta, orbPlaneta, orbCamara, tiempo, &planeta); break;
+                case 3: espiralObjeto(tPlaneta, espPlaneta, tiempo, &planeta); break;
+                case 4: espiralCamara(camara, espCamara, tiempo);
+                        planeta.establecerPosicion(1.3f, 0.0f, 0.0f);
+                        tPlaneta.trasladar(1.3f, 0.0f, 0.0f); break;
+                case 5: espiralAmbos(camara, tPlaneta, espPlaneta, espCamara, tiempo, &planeta); break;
+            }
+            tPlaneta.rotarX(tiempo * 45.0f);
+            tPlaneta.rotarY(tiempo * 45.0f);
+            tPlaneta.escalar(0.25f, 0.25f, 0.25f);
+
+            // Ya está decidida la cámara de este frame: se sube al shader
+            camara.aplicar(g_aspecto);
+
+            // ---------------- SOL (esfera, centro) ----------------
+            transformador.reiniciar();
+            transformador.rotarY(tiempo * 20.0f);
+            transformador.escalar(0.35f, 0.35f, 0.35f);
+            transformador.aplicar();
+            sol.dibujarRellenoYLineas(gestorColor, NombreColor::Amarillo, NombreColor::Naranja);
+
+            // ---------------- PLANETA (dibujo) ----------------
+            tPlaneta.aplicar();
+            planeta.dibujarRellenoYLineas(gestorColor, NombreColor::Cyan, coloresCubo, NombreColor::Negro);
+
+            // ---------------- LUNA (pirámide): orbita AL PLANETA ----------------
+            // Objetivo(planeta) usa la posición que acaba de calcularse arriba.
+            ConfigOrbita orbLuna(TipoOrbita::Convencional, Objetivo(planeta), 0.5f, 150.0f);
+            transformador.reiniciar();
+            orbitarObjeto(transformador, orbLuna, tiempo, &luna);
+            transformador.rotarY(tiempo * 90.0f);
+            transformador.escalar(0.12f, 0.12f, 0.12f);
+            transformador.aplicar();
+            luna.dibujarRellenoYLineas(gestorColor, NombreColor::Amarillo, coloresPiramide, NombreColor::Negro);
+
+            // ---------------- TRIÁNGULO (figura 2D) ----------------
+            transformador.reiniciar();
+            switch (modo) {
+                case 0: case 2: orbitarObjeto(transformador, orbTriang, tiempo, &triangulo); break;
+                case 3: case 5: espiralObjeto(transformador, espTriang, tiempo, &triangulo); break;
+                default:        transformador.trasladar(-2.0f, 0.0f, 0.0f); break;
+            }
+            transformador.rotarZ(tiempo * 60.0f);
+            transformador.escalar(0.2f, 0.2f, 0.2f);
+            transformador.aplicar();
+            triangulo.dibujarRellenoYLineas(gestorColor, NombreColor::VerdeFluorescente, NombreColor::Negro);
+
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+        }
+    } // <- aquí se destruyen las figuras, con el contexto todavía vivo
+
+    glDeleteProgram(shaderProgram);
+    glfwTerminate();
+    return 0;
+}
+
+void processInput(GLFWwindow *window) {
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+}
+// [MODIFICADO] además del viewport, actualiza la proporción para la cámara
+void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    glViewport(0, 0, width, height);
+    if (height > 0) g_aspecto = (float)width / (float)height;
+}
